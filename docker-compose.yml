@@ -1,0 +1,35 @@
+services:
+  # Jupyter notebook with MCP chat interface
+  jupyter:
+    image: mcp-server-trino-jupyter
+    build:
+      context: .
+      args:
+        - http_proxy=${http_proxy}
+        - https_proxy=${https_proxy:-${http_proxy}}
+        - HTTP_PROXY=${HTTP_PROXY:-${http_proxy}}
+        - HTTPS_PROXY=${HTTPS_PROXY:-${http_proxy}}
+        - no_proxy=${no_proxy:-localhost,127.0.0.1}
+        - NO_PROXY=${NO_PROXY:-${no_proxy:-localhost,127.0.0.1}}
+    ports:
+      - "8888:8888"
+    environment:
+      # Proxy settings (passed from host)
+      - http_proxy=${http_proxy}
+      - https_proxy=${https_proxy:-${http_proxy}}
+      - HTTP_PROXY=${HTTP_PROXY:-${http_proxy}}
+      - HTTPS_PROXY=${HTTPS_PROXY:-${http_proxy}}
+      - no_proxy=${no_proxy:-localhost,127.0.0.1}
+      - NO_PROXY=${NO_PROXY:-${no_proxy:-localhost,127.0.0.1}}
+
+      # Trino OAuth configuration (set these in your environment)
+      - TRINO_HOST=${TRINO_HOST}
+      - TOKEN_ENDPOINT=${TOKEN_ENDPOINT}
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+      - AUTH_MODE=${AUTH_MODE:-client_credentials}
+      - OIDC_DISCOVERY_URL=${OIDC_DISCOVERY_URL}
+      - KEYRING_CRYPTFILE_PASSWORD=${KEYRING_CRYPTFILE_PASSWORD:-test12345}
+    volumes:
+      - ./notebooks:/app/notebooks
+    command: jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password=''

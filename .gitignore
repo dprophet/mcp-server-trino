@@ -10,10 +10,22 @@ wheels/
 .venv
 Lib/
 Scripts/
+venv/
 
 # Development environment
 .python-version
 uv.lock
+
+# Environment files (sensitive credentials)
+.env
+.env.local
+.env.*.local
+.env.jupyter
+.env.proxy
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
 
 # IDE settings (optional)
 .vscode/
@@ -21,3 +33,7 @@ uv.lock
 
 # Distribution directories
 *.dist-info/
+
+# Copilot token cache
+notebooks/.copilot_github_token.json
+notebooks/.copilot_models.json

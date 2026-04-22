@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0",
-    "trino==0.333.0",
+    "trino[oauth] @ git+https://github.com/trinodb/trino-python-client.git@refs/pull/589/head",
+    "keyrings.alt>=5.0.0",
+    "openai>=2.32.0",
+    "httpx>=0.28.1"
 ]
 [[project.authors]]
 name = "Mahesh Premachandran"
@@ -15,6 +18,9 @@ email = "mahesh@getdataring.com"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [project.scripts]
 mcp_server_trino = "mcp_server_trino:main"

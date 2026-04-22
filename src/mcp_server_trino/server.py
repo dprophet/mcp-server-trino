@@ -1,61 +1,129 @@
 import asyncio
 import logging
 import os
+import sys
 from mcp.server import Server
 from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
 
 # Trino DB-API
-# pip install trino
 from trino.dbapi import connect
 from trino.exceptions import TrinoExternalError, TrinoQueryError
+from trino.auth import (
+    ClientCredentials,
+    DeviceCode,
+    OidcConfig,
+    ManualUrlsConfig
+)
 
-# Configure logging
+# Configure logging to stderr (stdout is reserved for JSON-RPC)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stderr
 )
 logger = logging.getLogger("mcp_server_trino")
 
 def get_db_config():
     """Get Trino configuration from environment variables."""
+    # Parse TRINO_HOST which may include port (e.g., "sql.example.com:443")
+    trino_host = os.getenv("TRINO_HOST")
+    if not trino_host:
+        raise ValueError("TRINO_HOST is required")
+
+    if ":" in trino_host:
+        host, port_str = trino_host.rsplit(":", 1)
+        port = int(port_str)
+    else:
+        host = trino_host
+        port = 443
+
     config = {
-        "host": os.getenv("TRINO_HOST", "localhost"),
-        "port": int(os.getenv("TRINO_PORT", "8080")),
-        "user": os.getenv("TRINO_USER"),
-        "password": os.getenv("TRINO_PASSWORD", ""),  # optional, depends on your Trino setup
-        "catalog": os.getenv("TRINO_CATALOG"),
-        "schema": os.getenv("TRINO_SCHEMA")
+        "host": host,
+        "port": port,
+
+        # Authentication - client_credentials (default) or device_code
+        "auth_mode": os.getenv("AUTH_MODE", "client_credentials"),
+        "client_id": os.getenv("CLIENT_ID"),
+        "client_secret": os.getenv("CLIENT_SECRET"),
+
+        # OAuth endpoints
+        "token_endpoint": os.getenv("TOKEN_ENDPOINT"),
+        "oidc_discovery_url": os.getenv("OIDC_DISCOVERY_URL"),
     }
 
-    # Basic validation
-    if not all([config["host"], config["port"], config["user"], config["catalog"], config["schema"]]):
-        logger.error("Missing required Trino configuration. Please check environment variables:")
-        logger.error("TRINO_HOST, TRINO_PORT, TRINO_USER, TRINO_CATALOG, and TRINO_SCHEMA are required")
-        raise ValueError("Missing required Trino configuration")
+    # Validate OAuth configuration
+    auth_mode = config["auth_mode"]
+
+    if auth_mode not in ["client_credentials", "device_code"]:
+        raise ValueError(
+            f"Invalid AUTH_MODE: '{auth_mode}'. "
+            "Must be 'client_credentials' or 'device_code'"
+        )
+
+    if not config["client_id"]:
+        raise ValueError("CLIENT_ID is required")
+    if not config["client_secret"]:
+        raise ValueError("CLIENT_SECRET is required")
+
+    if auth_mode == "client_credentials" and not config["token_endpoint"]:
+        raise ValueError("TOKEN_ENDPOINT is required for client_credentials mode")
+
+    if auth_mode == "device_code" and not config["oidc_discovery_url"]:
+        raise ValueError("OIDC_DISCOVERY_URL is required for device_code mode")
 
     return config
 
+def create_auth_config(cfg):
+    """Create authentication configuration based on auth_mode."""
+    auth_mode = cfg["auth_mode"]
+
+    logger.info(f"Using authentication mode: {auth_mode}")
+
+    # Client credentials flow - for service-to-service authentication
+    if auth_mode == "client_credentials":
+        return ClientCredentials(
+            client_id=cfg["client_id"],
+            client_secret=cfg["client_secret"],
+            url_config=ManualUrlsConfig(token_endpoint=cfg["token_endpoint"])
+        )
+
+    # Device code flow - for interactive authentication
+    elif auth_mode == "device_code":
+        return DeviceCode(
+            client_id=cfg["client_id"],
+            client_secret=cfg["client_secret"],
+            url_config=OidcConfig(oidc_discovery_url=cfg["oidc_discovery_url"])
+        )
+
+    else:
+        raise ValueError(
+            f"Invalid AUTH_MODE: '{auth_mode}'. "
+            "Must be 'client_credentials' or 'device_code'"
+        )
+
 def create_trino_connection():
-    """Create a Trino connection using the environment-based config with Basic Authentication."""
-    from trino.auth import BasicAuthentication
-    
+    """Create a Trino connection using OAuth."""
     cfg = get_db_config()
-    
-    # Set up Basic Authentication if password is provided
-    auth = None
-    if cfg["password"]:
-        auth = BasicAuthentication(cfg["user"], cfg["password"])
-    
-    return connect(
-        host=cfg["host"],
-        port=cfg["port"],
-        user=cfg["user"],
-        catalog=cfg["catalog"],
-        schema=cfg["schema"],
-        http_scheme="https" if cfg["password"] else "http",
-        auth=auth
-    )
+    auth = create_auth_config(cfg)
+
+    # Build connection params - only include catalog/schema if set
+    conn_params = {
+        "host": cfg["host"],
+        "port": cfg["port"],
+        "http_scheme": "https",
+        "auth": auth
+    }
+
+    # Add optional catalog/schema if set in environment
+    catalog = os.getenv("CATALOG")
+    schema = os.getenv("SCHEMA")
+    if catalog:
+        conn_params["catalog"] = catalog
+    if schema:
+        conn_params["schema"] = schema
+
+    return connect(**conn_params)
 
 # Initialize server
 app = Server("mcp_server_trino")
@@ -90,32 +158,70 @@ async def list_tools() -> list[Tool]:
 @app.list_resources()
 async def list_resources() -> list[Resource]:
     """
-    List tables in the configured Trino catalog & schema as resources.
+    List Trino resources dynamically based on configuration:
+    - No CATALOG set: show all catalogs
+    - CATALOG set but no SCHEMA: show schemas in that catalog
+    - Both set: show tables in that catalog.schema
     """
-    config = get_db_config()
-    catalog = config["catalog"]
-    schema = config["schema"]
+    catalog = os.getenv("CATALOG")
+    schema = os.getenv("SCHEMA")
 
     try:
         conn = create_trino_connection()
         cursor = conn.cursor()
-        # Query the schema for tables; "SHOW TABLES IN catalog.schema" is valid in Trino
-        show_tables_sql = f"SHOW TABLES IN {catalog}.{schema}"
-        cursor.execute(show_tables_sql)
-        tables = cursor.fetchall()  # each row is like ('table_name',)
-        logger.info(f"Found tables: {tables}")
-        
         resources = []
-        for (table_name,) in tables:
-            resources.append(
-                Resource(
-                    # e.g. trino://mytable/data
-                    uri=f"trino://{table_name}/data",
-                    name=f"Table: {table_name}",
-                    mimeType="text/plain",
-                    description=f"Data in table: {table_name}"
+
+        # Case 1: No catalog set - show all catalogs
+        if not catalog:
+            logger.info("No CATALOG set - listing all catalogs")
+            cursor.execute("SHOW CATALOGS")
+            catalogs = cursor.fetchall()
+            logger.info(f"Found catalogs: {catalogs}")
+
+            for (catalog_name,) in catalogs:
+                resources.append(
+                    Resource(
+                        uri=f"trino://catalog/{catalog_name}",
+                        name=f"Catalog: {catalog_name}",
+                        mimeType="text/plain",
+                        description=f"Trino catalog: {catalog_name}"
+                    )
                 )
-            )
+
+        # Case 2: Catalog set but no schema - show schemas in catalog
+        elif not schema:
+            logger.info(f"CATALOG={catalog} set - listing schemas")
+            cursor.execute(f"SHOW SCHEMAS FROM {catalog}")
+            schemas = cursor.fetchall()
+            logger.info(f"Found schemas: {schemas}")
+
+            for (schema_name,) in schemas:
+                resources.append(
+                    Resource(
+                        uri=f"trino://catalog/{catalog}/schema/{schema_name}",
+                        name=f"Schema: {catalog}.{schema_name}",
+                        mimeType="text/plain",
+                        description=f"Trino schema in {catalog}: {schema_name}"
+                    )
+                )
+
+        # Case 3: Both catalog and schema set - show tables
+        else:
+            logger.info(f"CATALOG={catalog}, SCHEMA={schema} set - listing tables")
+            cursor.execute(f"SHOW TABLES IN {catalog}.{schema}")
+            tables = cursor.fetchall()
+            logger.info(f"Found tables: {tables}")
+
+            for (table_name,) in tables:
+                resources.append(
+                    Resource(
+                        uri=f"trino://{catalog}/{schema}/{table_name}",
+                        name=f"Table: {catalog}.{schema}.{table_name}",
+                        mimeType="text/plain",
+                        description=f"Table in {catalog}.{schema}: {table_name}"
+                    )
+                )
+
         cursor.close()
         conn.close()
         return resources
@@ -130,9 +236,8 @@ async def read_resource(uri: AnyUrl) -> str:
     Read up to 100 rows from the given table resource.
     Expects a URI like: trino://table_name/data
     """
-    config = get_db_config()
-    catalog = config["catalog"]
-    schema = config["schema"]
+    catalog = os.getenv("CATALOG")
+    schema = os.getenv("SCHEMA")
     uri_str = str(uri)
     logger.info(f"Reading resource: {uri_str}")
 
@@ -146,7 +251,13 @@ async def read_resource(uri: AnyUrl) -> str:
     try:
         conn = create_trino_connection()
         cursor = conn.cursor()
-        query = f"SELECT * FROM {catalog}.{schema}.{table} LIMIT 100"
+
+        # Build query with optional catalog.schema prefix
+        if catalog and schema:
+            query = f"SELECT * FROM {catalog}.{schema}.{table} LIMIT 100"
+        else:
+            query = f"SELECT * FROM {table} LIMIT 100"
+
         logger.info(f"Executing query: {query}")
         cursor.execute(query)
 
@@ -154,7 +265,7 @@ async def read_resource(uri: AnyUrl) -> str:
         rows = cursor.fetchall()
         result_lines = [",".join(map(str, row)) for row in rows]
         header_line = ",".join(columns)
-        
+
         cursor.close()
         conn.close()
         return "\n".join([header_line] + result_lines)
@@ -186,10 +297,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # For statements like SHOW TABLES, we fetch and return them
         if query.strip().upper().startswith("SHOW "):
             rows = cursor.fetchall()
-            # Typically, 'SHOW TABLES IN catalog.schema' returns rows of table names
             result = []
             for row in rows:
-                # row could be a tuple like ('table_name',), or more columns depending on "SHOW"
                 result.append("\t".join(map(str, row)))
             cursor.close()
             conn.close()
@@ -207,7 +316,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         # For other queries (CREATE, DROP, INSERT, etc.), just return success info
         else:
-            # Trino typically doesn't require commit; it's auto-commit style
             cursor.close()
             conn.close()
             return [TextContent(type="text", text="Query executed successfully.")]
@@ -221,8 +329,14 @@ async def main():
     from mcp.server.stdio import stdio_server
 
     logger.info("Starting Trino MCP server...")
-    config = get_db_config()
-    logger.info(f"Trino config: {config['host']}:{config['port']}/{config['catalog']}.{config['schema']} as {config['user']}")
+
+    try:
+        config = get_db_config()
+        logger.info(f"Trino: {config['host']}:{config['port']}")
+        logger.info(f"Auth mode: {config['auth_mode']}")
+    except Exception as e:
+        logger.error(f"Configuration error: {str(e)}")
+        raise
 
     async with stdio_server() as (read_stream, write_stream):
         try:
