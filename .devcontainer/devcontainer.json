@@ -1,0 +1,25 @@
+{
+  "name": "Trino MCP Server",
+  "build": {
+    "dockerfile": "../Dockerfile"
+  },
+  "forwardPorts": [8888],
+  "postStartCommand": "jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password=''",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-toolsai.jupyter",
+        "ms-python.python"
+      ],
+      "settings": {
+        "jupyter.notebookFileRoot": "/app/notebooks"
+      }
+    }
+  },
+  "portsAttributes": {
+    "8888": {
+      "label": "Jupyter Notebook",
+      "onAutoForward": "openBrowser"
+    }
+  }
+}
